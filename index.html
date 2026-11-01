@@ -3,11 +3,51 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Open-Source Pull Requests</title>
-<meta name="description" content="Pull requests to Vercel's open-source projects: a link fix and a speed-up for Streamdown, and a crash fix for Workflow.">
+<title>Open-Source Pull Requests to Vercel · Nishil Faldu</title>
+<meta name="description" content="Nishil Faldu's pull requests to Vercel's open-source projects: a link fix and a speed-up for Streamdown, and a crash fix for Workflow. Each has a live demo.">
+<meta name="author" content="Nishil Faldu">
+<link rel="canonical" href="https://oss.nishilfaldu.site/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://oss.nishilfaldu.site/">
+<meta property="og:site_name" content="Nishil Faldu">
+<meta property="og:title" content="Open-Source Pull Requests to Vercel">
+<meta property="og:description" content="A link fix and a speed-up for Streamdown, and a crash fix for Workflow. Each has a live demo.">
+<meta property="og:image" content="https://oss.nishilfaldu.site/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Open-source pull requests to Vercel: Streamdown #685, Streamdown #689 and Workflow #4932.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Open-Source Pull Requests to Vercel">
+<meta name="twitter:description" content="A link fix and a speed-up for Streamdown, and a crash fix for Workflow. Each has a live demo.">
+<meta name="twitter:image" content="https://oss.nishilfaldu.site/og.png">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='10' fill='%231f1f1f'/%3E%3Cpath d='M16 8.5a7.5 7.5 0 0 0 0 15z' fill='%23fff'/%3E%3Cpath d='M16 8.5a7.5 7.5 0 0 1 0 15z' fill='%235b8def'/%3E%3C/svg%3E">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "CollectionPage",
+  "name": "Open-Source Pull Requests to Vercel",
+  "url": "https://oss.nishilfaldu.site/",
+  "description": "Nishil Faldu's pull requests to Vercel's open-source projects, each with a live demo.",
+  "author": {
+    "@type": "Person",
+    "name": "Nishil Faldu",
+    "url": "https://github.com/nishilfaldu",
+    "sameAs": ["https://github.com/nishilfaldu"]
+  },
+  "mainEntity": {
+    "@type": "ItemList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "item": { "@type": "SoftwareSourceCode", "name": "fix(remend): complete links only in the current block", "url": "https://github.com/vercel/streamdown/pull/685", "codeRepository": "https://github.com/vercel/streamdown" } },
+      { "@type": "ListItem", "position": 2, "item": { "@type": "SoftwareSourceCode", "name": "perf(streamdown): repair only the end of a streaming message", "url": "https://github.com/vercel/streamdown/pull/689", "codeRepository": "https://github.com/vercel/streamdown" } },
+      { "@type": "ListItem", "position": 3, "item": { "@type": "SoftwareSourceCode", "name": "[world-local] Finish step and wait writes that a crash cut short", "url": "https://github.com/vercel/workflow/pull/4932", "codeRepository": "https://github.com/vercel/workflow" } }
+    ]
+  }
+}
+</script>
 <script>try { var t = localStorage.getItem("oss-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -43,6 +83,7 @@
 
 <main id="top">
   <div class="wrap">
+    <h1 class="sr-only">Open-source pull requests to Vercel by Nishil Faldu</h1>
     <p class="intro">Pull requests I sent to Vercel's open-source projects. For Streamdown, its component for showing streaming AI answers: a <a href="#link-fix">link fix</a> and a <a href="#speed-up">speed-up</a>. For Workflow, its toolkit for durable functions: a <a href="#crash-fix">crash fix</a>.</p>
     <div class="switch" role="tablist" aria-label="Pull requests"><button role="tab" type="button" data-to="0">Link fix</button><button role="tab" type="button" data-to="1">Speed-up</button><button role="tab" type="button" data-to="2">Crash fix</button></div>
 

@@ -21,4 +21,6 @@ A static page with no build step: `index.html`, `styles.css` and `app.js`. The S
 
 Each file is an esbuild bundle (`--bundle --format=esm --minify`). The Workflow demo is a script of the writes in #4932 (45dd33d), not its code, because the Local World needs a file system and processes. Its numbers come from the pull request's crash test.
 
+`og.png` is the link preview image. `robots.txt`, `sitemap.xml` and the icon files sit next to the page.
+
 To preview, serve the folder, for example `python3 -m http.server`.
