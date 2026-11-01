@@ -1,5 +1,6 @@
 // remend from upstream main and from the link fix, the speed-up branch's tail
-// repair, and marked to render output.
+// repair, and marked to render output. The crash fix demo is a script of the
+// Workflow pull request's writes, not its code.
 import remendMain from "./vendor/remend-main.js";
 import remendPr685 from "./vendor/remend-pr685.js";
 import { marked } from "./vendor/marked.js";
@@ -304,6 +305,145 @@ $("rule").innerHTML =
   $("time").innerHTML = s;
 }
 
+/* Crash fix: a process killed between the claim and the event */
+
+const crashCases = [
+  {
+    label: "Step ends",
+    event: "step_completed",
+    noun: "step",
+    claim: ".locks/….terminal",
+    from: "running",
+    to: "completed",
+    before: ["The run goes quiet", "Each restart runs the step again and drops its result"],
+    done: "The run moves on",
+  },
+  {
+    label: "Step ends, result saved",
+    event: "step_completed",
+    noun: "step",
+    claim: ".locks/….terminal",
+    from: "running",
+    to: "completed",
+    saved: true,
+    before: ["The run goes quiet", "The saved result never reaches the log"],
+    done: "The run moves on with the saved result",
+  },
+  {
+    label: "Wait ends",
+    event: "wait_completed",
+    noun: "wait",
+    claim: ".locks/….completed",
+    from: "waiting",
+    to: "completed",
+    refuse: 'Wait "…" already completed',
+    before: ["The run replays once a second", "Every replay is refused"],
+    done: "The run moves on",
+  },
+  {
+    label: "Step starts",
+    event: "step_created",
+    noun: "step",
+    claim: ".locks/….created",
+    from: null,
+    to: "created",
+    refuse: 'Step "…" already created',
+    before: ["The run replays 140–450 times a second", "Every replay is refused"],
+    done: "The step runs, and the run moves on",
+  },
+];
+
+// Each step is [log line, change to the state, log style]. Both sides share
+// the crash, then the next write either refuses or takes the claim over.
+function crashFrames(c) {
+  const shared = [
+    ["Process 4121 writes the claim", { claim: "pid 4121", changed: "claim" }],
+    ...(c.saved ? [[`It saves the ${c.noun} file`, { entity: c.to, changed: "entity" }]] : []),
+    ["SIGKILL: process 4121 is gone", { dead: true }, "bad"],
+    [`Restart: process 5307 writes ${c.event}`, { pid: 5307, dead: false }],
+  ];
+  const before = [
+    [`Claim taken. Refused: ${c.refuse || "Cannot modify step in terminal state"}`, { status: ["Stuck", "bad"], missing: true }, "bad"],
+    ...c.before.map((line) => [line, {}, "bad"]),
+  ];
+  const after = [
+    ["The claim names pid 4121 on this host. It no longer runs", {}],
+    [`No ${c.event} in the log: take the claim over`, { claim: "pid 5307", changed: "claim", ours: true }, "good"],
+    c.saved
+      ? ["The step file says completed. Use its result", { changed: "entity", ours: true }, "good"]
+      : [`Write the ${c.noun} file`, { entity: c.to, changed: "entity", ours: true }, "good"],
+    [`Write ${c.event}`, { event: "written", changed: "event", ours: true }, "good"],
+    [c.done, { status: ["Done", "ok"] }, "good"],
+  ];
+  const run = (steps, start) => {
+    const states = [];
+    let s = start;
+    for (const [line, patch, cls] of steps) {
+      s = { ...s, changed: null, ours: false, ...patch, log: [...s.log, [line, cls || ""]] };
+      states.push(s);
+    }
+    return states;
+  };
+  const start = { status: ["Running", ""], pid: 4121, dead: false, claim: null, entity: c.from, event: null, log: [] };
+  const common = run(shared, start);
+  const last = common[common.length - 1];
+  const b = run(before, last);
+  const a = run(after, last);
+  const pad = (list) => [...list, ...Array(Math.max(b.length, a.length) - list.length).fill({ ...list[list.length - 1], changed: null })];
+  return [...common.map((s) => ({ before: s, after: s })), ...pad(b).map((s, k) => ({ before: s, after: pad(a)[k] }))];
+}
+
+function crashSide(prefix, s, c, current) {
+  const status = $(`${prefix}-status`);
+  status.textContent = s.status[0];
+  status.className = `pill ${s.status[1]}`;
+  $(`${prefix}-proc`).innerHTML = `<i class="${s.dead ? "dead" : "live"}"></i>Process ${s.pid}${s.dead ? " killed" : ""}`;
+  const rows = [
+    ["claim", "Claim", c.claim, s.claim],
+    ["entity", c.noun === "step" ? "Step" : "Wait", `${c.noun}s/….json`, s.entity],
+    ["event", "Event", c.event, s.event ?? (s.missing ? "missing" : null)],
+  ];
+  $(`${prefix}-files`).innerHTML = rows
+    .map(([key, name, path, value]) => {
+      const cls = s.changed === key ? (s.ours ? "rep" : "hot") : key === "event" && s.missing ? "add" : "";
+      return `<div class="blk file ${cls}"><span class="no">${name}</span><span class="txt">${esc(path)}</span><span class="n">${esc(value ?? "–")}</span></div>`;
+    })
+    .join("");
+  $(`${prefix}-log`).innerHTML = s.log
+    .map(([line, cls], k) => `<li class="${cls}${current && k === s.log.length - 1 ? " now" : ""}">${esc(line)}</li>`)
+    .join("");
+}
+
+let crashIndex = 0;
+let demo3Frames = [];
+const crashTabs = $("demo3-tabs");
+crashTabs.innerHTML = crashCases
+  .map((c, i) => `<button class="tab" role="tab" type="button" aria-selected="${i === 0}" data-i="${i}">${esc(c.label)}</button>`)
+  .join("");
+
+function renderDemo3(i) {
+  const c = crashCases[crashIndex];
+  const f = demo3Frames[i];
+  const prev = demo3Frames[i - 1];
+  crashSide("demo3-main", f.before, c, !prev || prev.before !== f.before);
+  crashSide("demo3-pr", f.after, c, !prev || prev.after !== f.after);
+}
+
+const demo3 = player({ frames: 1, render: renderDemo3, button: $("demo3-play"), range: $("demo3-range"), interval: 1100, hold: 3600 });
+
+function selectCrash(i) {
+  crashIndex = i;
+  for (const b of crashTabs.children) b.setAttribute("aria-selected", String(Number(b.dataset.i) === i));
+  demo3Frames = crashFrames(crashCases[i]);
+  demo3.setFrames(demo3Frames.length);
+  demo3.reset(reducedMotion ? demo3Frames.length - 1 : 0);
+}
+crashTabs.onclick = (e) => {
+  const b = e.target.closest(".tab");
+  if (b) selectCrash(Number(b.dataset.i));
+};
+selectCrash(0);
+
 /* Card deck */
 
 {
@@ -317,6 +457,8 @@ $("rule").innerHTML =
     cards.forEach((card, k) => {
       card.classList.toggle("front", k === i);
       card.classList.toggle("back", k !== i);
+      // The next card peeks out just above the front one, the one after it higher up.
+      card.dataset.depth = String((k - i + cards.length) % cards.length);
       card.querySelector(".card-body").inert = k !== i;
     });
     for (const t of tabsEl) t.setAttribute("aria-selected", String(Number(t.dataset.to) === i));
@@ -327,7 +469,9 @@ $("rule").innerHTML =
   };
 
   const other = () => (front + 1) % cards.length;
-  for (const card of cards) card.querySelector(".card-strip").onclick = () => show(other());
+  cards.forEach((card, k) => {
+    card.querySelector(".card-strip").onclick = () => show(k === front ? other() : k);
+  });
   for (const t of tabsEl) t.onclick = () => show(Number(t.dataset.to));
 
   addEventListener("keydown", (e) => {
@@ -377,7 +521,7 @@ $("rule").innerHTML =
     b.onclick = () => {
       const t = b.dataset.theme === "system" ? null : b.dataset.theme;
       apply(t);
-      try { if (t) localStorage.setItem("driftmark-theme", t); else localStorage.removeItem("driftmark-theme"); } catch {}
+      try { if (t) localStorage.setItem("oss-theme", t); else localStorage.removeItem("oss-theme"); } catch {}
     };
   }
 }

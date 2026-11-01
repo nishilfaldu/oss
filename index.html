@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Two Streamdown Pull Requests</title>
-<meta name="description" content="A link-repair fix and a streaming speed-up for Streamdown, Vercel's React component for streaming Markdown. The demos run the real code.">
+<title>Open-Source Pull Requests</title>
+<meta name="description" content="Pull requests to Vercel's open-source projects: a link fix and a speed-up for Streamdown, and a crash fix for Workflow.">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='10' fill='%231f1f1f'/%3E%3Cpath d='M16 8.5a7.5 7.5 0 0 0 0 15z' fill='%23fff'/%3E%3Cpath d='M16 8.5a7.5 7.5 0 0 1 0 15z' fill='%235b8def'/%3E%3C/svg%3E">
-<script>try { var t = localStorage.getItem("driftmark-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<script>try { var t = localStorage.getItem("oss-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap">
@@ -29,7 +29,8 @@
       <nav>
         <a href="https://github.com/vercel/streamdown/pull/685">#685 Link fix</a>
         <a href="https://github.com/vercel/streamdown/pull/689">#689 Speed-up</a>
-        <a class="wide" href="https://github.com/nishilfaldu/driftmark">GitHub</a>
+        <a href="https://github.com/vercel/workflow/pull/4932">#4932 Crash fix</a>
+        <a class="wide" href="https://github.com/nishilfaldu/oss">GitHub</a>
       </nav>
       <div class="themes" id="themes" role="group" aria-label="Theme">
         <button type="button" data-theme="system" aria-label="System theme" title="System"><svg><use href="#i-system"/></svg></button>
@@ -42,14 +43,15 @@
 
 <main id="top">
   <div class="wrap">
-    <p class="intro">Two pull requests I sent to Streamdown, Vercel's component for showing streaming AI answers: a <a href="#link-fix">link fix</a> and a <a href="#speed-up">speed-up</a>.</p>
-    <div class="switch" role="tablist" aria-label="Pull requests"><button role="tab" type="button" data-to="0">Link fix</button><button role="tab" type="button" data-to="1">Speed-up</button></div>
+    <p class="intro">Pull requests I sent to Vercel's open-source projects. For Streamdown, its component for showing streaming AI answers: a <a href="#link-fix">link fix</a> and a <a href="#speed-up">speed-up</a>. For Workflow, its toolkit for durable functions: a <a href="#crash-fix">crash fix</a>.</p>
+    <div class="switch" role="tablist" aria-label="Pull requests"><button role="tab" type="button" data-to="0">Link fix</button><button role="tab" type="button" data-to="1">Speed-up</button><button role="tab" type="button" data-to="2">Crash fix</button></div>
 
     <div class="deck" id="deck">
     <article class="deck-card front" id="link-fix" aria-label="Link fix">
-      <button class="card-strip" type="button"><span>Link fix<em>1 of 2</em></span><span class="next">Next: Speed-up →</span></button>
+      <button class="card-strip" type="button"><span>Link fix<em>1 of 3</em></span><span class="next">Next: Speed-up →</span></button>
       <div class="card-body">
       <div class="part-head">
+        <a class="eyebrow" href="https://github.com/vercel/streamdown/pull/685">Streamdown #685</a>
         <h2 class="name">Link fix</h2>
         <p class="tagline">A stray <code>[</code> damages the text after it</p>
         <div class="ba"><div class="ba-row before"><span class="ba-k">Before</span><span>Remend pairs it with text in later paragraphs.</span></div><div class="ba-row after"><span class="ba-k">After</span><span>Links complete only in the current block.</span></div></div>
@@ -73,9 +75,10 @@
     </article>
 
     <article class="deck-card back" id="speed-up" aria-label="Speed-up">
-      <button class="card-strip" type="button"><span>Speed-up<em>2 of 2</em></span><span class="next">Next: Link fix →</span></button>
+      <button class="card-strip" type="button"><span>Speed-up<em>2 of 3</em></span><span class="next">Next: Crash fix →</span></button>
       <div class="card-body" inert>
       <div class="part-head">
+        <a class="eyebrow" href="https://github.com/vercel/streamdown/pull/689">Streamdown #689</a>
         <h2 class="name">Speed-up</h2>
         <p class="tagline">Repair only the end of the message</p>
         <div class="ba"><div class="ba-row before"><span class="ba-k">Before</span><span>Every update repairs the whole message.</span></div><div class="ba-row after"><span class="ba-k">After</span><span>Only the last two blocks are repaired.</span></div></div>
@@ -141,6 +144,70 @@
         </div>
         <div class="pairs" id="rule"></div>
       </div>
+      </div>
+    </article>
+
+    <article class="deck-card back" id="crash-fix" aria-label="Crash fix">
+      <button class="card-strip" type="button"><span>Crash fix<em>3 of 3</em></span><span class="next">Next: Link fix →</span></button>
+      <div class="card-body" inert>
+      <div class="part-head">
+        <a class="eyebrow" href="https://github.com/vercel/workflow/pull/4932">Workflow #4932</a>
+        <h2 class="name">Crash fix</h2>
+        <p class="tagline">A crash between two writes leaves a run stuck for good</p>
+        <div class="ba"><div class="ba-row before"><span class="ba-k">Before</span><span>The next write finds the dead writer's claim and refuses.</span></div><div class="ba-row after"><span class="ba-k">After</span><span>The next write takes the claim over and writes the missing event.</span></div></div>
+      </div>
+
+      <p class="prose">The Local World keeps runs in files on disk. It records a step or wait change in three writes: a claim that only one writer can create, then the step or wait file, then the event. Replay reads only the events. If the process dies after the claim and before the event, no later write can finish the change.</p>
+
+      <div class="panel" id="demo3">
+        <div class="panel-bar">
+          <div class="tabs" role="tablist" aria-label="Crash points" id="demo3-tabs"></div>
+          <div class="controls">
+            <button class="btn" id="demo3-play" type="button">Pause</button>
+            <input type="range" id="demo3-range" min="1" max="1" value="1" aria-label="Position in the crash">
+          </div>
+        </div>
+        <div class="tail-grid">
+          <div>
+            <div class="crash-top"><span class="col-label today">Before</span><span class="pill" id="demo3-main-status"></span></div>
+            <div class="proc" id="demo3-main-proc"></div>
+            <div class="blocks" id="demo3-main-files"></div>
+            <ol class="log" id="demo3-main-log"></ol>
+          </div>
+          <div>
+            <div class="crash-top"><span class="col-label pr">After</span><span class="pill" id="demo3-pr-status"></span></div>
+            <div class="proc" id="demo3-pr-proc"></div>
+            <div class="blocks" id="demo3-pr-files"></div>
+            <ol class="log" id="demo3-pr-log"></ol>
+          </div>
+        </div>
+      </div>
+
+      <div class="sub-head"><h3>When the next write takes the claim over</h3></div>
+      <div class="panel">
+        <div class="pairs">
+          <div class="blocks">
+            <div class="blk"><span class="no">1</span><span class="txt">Is the event already in the log?<br><span class="today">Yes: refuse. The change is done.</span></span><span class="n"></span></div>
+            <div class="blk"><span class="no">2</span><span class="txt">Can the writer still be working? Its process still runs, or it can't be checked, for example on another machine.<br><span class="today">Yes: refuse until the claim is 30 s old.</span></span><span class="n"></span></div>
+            <div class="blk rep"><span class="no">3</span><span class="txt">Otherwise the writer is gone.<br><span class="pr">Take the claim over, then write the file and the missing event.</span></span><span class="n"></span></div>
+          </div>
+          <p class="foot">The claim now holds the writer's process id and host name. If two writes find the same dead claim, only one wins. If the step file already says completed or failed, the event is built from it, so the result is kept.</p>
+        </div>
+      </div>
+
+      <div class="sub-head"><h3>Crash test: a <code>nitro dev</code> server killed at each write</h3></div>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Kill point</th><th class="num">Runs</th><th>Before</th><th>After</th></tr></thead>
+          <tbody>
+            <tr><td>After the step claim, before <code>step_completed</code></td><td class="num">6</td><td class="today">6 stuck</td><td class="pr">6 complete in 28.6–29.8 s*</td></tr>
+            <tr><td>After the wait claim, before <code>wait_completed</code></td><td class="num">6</td><td class="today">6 stuck</td><td class="pr">6 complete in 0.5–1.0 s</td></tr>
+            <tr><td>After the event (control)</td><td class="num">6</td><td>6 complete in 0.5–0.7 s</td><td>Same</td></tr>
+            <tr><td>Saved data of runs stuck after <code>step_created</code> was lost</td><td class="num">3</td><td class="today">3 stuck</td><td class="pr">3 complete in 30–33 s**</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="foot">* The test gives each step a 30 s lease, and the step is sent again when the lease ends. The takeover itself is immediate. ** Claims from an older version name no writer, so they wait for the 30 s rule. Stuck runs stayed stuck after a second restart.</p>
       </div>
     </article>
     </div>

@@ -1,0 +1,1373 @@
+diff --git a/.changeset/world-local-claim-repair.md b/.changeset/world-local-claim-repair.md
+new file mode 100644
+index 000000000..cb23a38ac
+--- /dev/null
++++ b/.changeset/world-local-claim-repair.md
+@@ -0,0 +1,5 @@
++---
++"@workflow/world-local": patch
++---
++
++Finish a step or wait write that a crash cut short. A process killed after a step or wait claim and before its event left the run stuck for good; the next write now takes over a claim whose writer is gone and writes the missing event.
+diff --git a/packages/world-local/README.md b/packages/world-local/README.md
+index 09e33326c..af9d1f2ee 100644
+--- a/packages/world-local/README.md
++++ b/packages/world-local/README.md
+@@ -15,6 +15,11 @@ directory publishes one `hook_created` event. A losing creator reports an
+ entity conflict without appending another creation, including when a retry
+ publishes before the original token-claim owner.
+ 
++A step or wait write that a killed process left unfinished, with its claim
++file written and its event not, is finished by the next write of that step or
++wait. The claim names its writer. The next write takes it over once that writer
++no longer runs on this host, or once the claim is 30 seconds old.
++
+ Its HTTP queue handler supports receiving `invoke: true` messages and returns
+ the callback's value as `{ result }`. For example, a callback returning
+ `{ timeoutSeconds: 5 }` produces `{ result: { timeoutSeconds: 5 } }`. The value is
+diff --git a/packages/world-local/src/storage/claim-owner.ts b/packages/world-local/src/storage/claim-owner.ts
+new file mode 100644
+index 000000000..341f2655c
+--- /dev/null
++++ b/packages/world-local/src/storage/claim-owner.ts
+@@ -0,0 +1,207 @@
++/**
++ * Owners of the step and wait claim files under `.locks/`.
++ *
++ * A step or wait change takes a claim with `writeExclusive` before it writes
++ * its entity and its event. A process that dies in between leaves the claim
++ * without the event. Every later write of that change loses the claim, so
++ * without a way to tell a dead writer from a working one, the event is never
++ * written and the run never advances.
++ *
++ * The claim therefore names its writer. A write that loses the claim and finds
++ * no event in the log takes the claim over only when that writer is known to be
++ * dead, or when the claim is older than {@link CLAIM_ABANDONED_AFTER_MS}.
++ */
++import { createHash, randomUUID } from 'node:crypto';
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import { globalSingleton } from '@workflow/utils';
++import { write, writeExclusive } from '../fs.js';
++
++/**
++ * Age after which a claim with no event is abandoned even when its writer may
++ * still run (another host, another storage instance in this process, a pid in
++ * use again, or a claim written before claims named their writer). A writer
++ * takes milliseconds from its claim to its event, so this only decides how
++ * long a crashed run waits when its writer's death cannot be proven. It is the
++ * `stale` age of this World's lock files.
++ */
++export const CLAIM_ABANDONED_AFTER_MS = 30_000;
++
++interface ClaimOwner {
++  pid: number;
++  host: string;
++  /** Random per process, so a later process that reuses the pid differs. */
++  process: string;
++  /** Random per events storage instance. */
++  instance: string;
++}
++
++// Process-wide: every copy of this module in one process must agree on it.
++const identity = globalSingleton(
++  '@workflow/world-local//claim-owner',
++  1,
++  () => ({
++    process: randomUUID(),
++    host: os.hostname(),
++  })
++);
++
++/** A new id for one events storage instance. */
++export function newClaimInstanceId(): string {
++  return randomUUID();
++}
++
++/** The content of a claim file written by `instance` in this process. */
++export function claimOwnerContent(instance: string): string {
++  const owner: ClaimOwner = {
++    pid: process.pid,
++    host: identity.host,
++    process: identity.process,
++    instance,
++  };
++  return JSON.stringify(owner);
++}
++
++function parseClaimOwner(content: string): ClaimOwner | null {
++  try {
++    const value = JSON.parse(content);
++    if (
++      typeof value?.pid === 'number' &&
++      typeof value.host === 'string' &&
++      typeof value.process === 'string' &&
++      typeof value.instance === 'string'
++    ) {
++      return value;
++    }
++  } catch {
++    // An empty claim, from a version that did not name the writer.
++  }
++  return null;
++}
++
++/**
++ * Whether the claim's writer is known to be dead. False means it may still
++ * be working.
++ *
++ * The caller holds the per-step or per-wait in-process lock, so a claim this
++ * same instance wrote belongs to a call that has already ended.
++ */
++function isClaimOwnerDead(owner: ClaimOwner | null, instance: string): boolean {
++  if (!owner) return false;
++  if (owner.process === identity.process) {
++    return owner.instance === instance;
++  }
++  if (owner.host !== identity.host) return false;
++  // Another process with our pid can only be an earlier one, now dead.
++  if (owner.pid === process.pid) return true;
++  try {
++    process.kill(owner.pid, 0);
++    return false;
++  } catch (error) {
++    return (error as NodeJS.ErrnoException).code === 'ESRCH';
++  }
++}
++
++async function readClaim(
++  claimPath: string
++): Promise<{ content: string; stat: { ino: number; mtimeMs: number } } | null> {
++  let file: fs.FileHandle;
++  try {
++    file = await fs.open(claimPath, 'r');
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
++    throw error;
++  }
++  try {
++    // Content and stat from one open file, so they describe the same claim
++    // even if a takeover replaces it meanwhile.
++    const [content, stat] = await Promise.all([
++      file.readFile('utf8'),
++      file.stat(),
++    ]);
++    return { content, stat };
++  } finally {
++    await file.close();
++  }
++}
++
++/**
++ * Takes over the claim at `claimPath` for `instance` when the claim is
++ * abandoned and `isOrphaned` confirms its event is not in the log, and
++ * reports whether it did.
++ *
++ * False means the writer may still be working, the event was written, the
++ * claim is gone, or another writer took it over first: the caller refuses, as
++ * it did before this existed. `isOrphaned` (a scan of the run's log) runs only
++ * for an abandoned claim, so a claim with a live writer costs one small read.
++ */
++export async function takeOverAbandonedClaim(
++  claimPath: string,
++  instance: string,
++  isOrphaned: () => Promise<boolean>
++): Promise<boolean> {
++  return takeOver(claimPath, instance, isOrphaned, 0);
++}
++
++/**
++ * How many takers in a row, each dead before it rewrote what it took, a
++ * takeover looks past. Each one is a separate crash, so this is never reached
++ * in practice; it only bounds the recursion.
++ */
++const MAX_TAKEOVER_DEPTH = 8;
++
++async function takeOver(
++  claimPath: string,
++  instance: string,
++  isOrphaned: () => Promise<boolean>,
++  depth: number
++): Promise<boolean> {
++  const claim = await readClaim(claimPath);
++  if (!claim) return false;
++  const abandoned =
++    isClaimOwnerDead(parseClaimOwner(claim.content), instance) ||
++    Date.now() - claim.stat.mtimeMs >= CLAIM_ABANDONED_AFTER_MS;
++  if (!abandoned || !(await isOrphaned())) return false;
++  // One taker per abandoned claim. The marker is keyed by the claim as read,
++  // and the takeover replaces the claim (a new inode naming the taker), so a
++  // taker that dies after rewriting the claim leaves a claim with a new key.
++  // A taker that dies before rewriting it leaves its marker behind, so the
++  // marker names its taker too, and is taken over the same way.
++  const key = createHash('sha256')
++    .update(`${claim.stat.ino}:${claim.stat.mtimeMs}:${claim.content}`)
++    .digest('hex')
++    .slice(0, 16);
++  const marker = `${claimPath}.takeover.${key}`;
++  const won =
++    (await writeExclusive(marker, claimOwnerContent(instance))) ||
++    (depth < MAX_TAKEOVER_DEPTH &&
++      (await takeOver(marker, instance, async () => true, depth + 1)));
++  if (!won) return false;
++  // Only the marker's holder rewrites the claim. If the claim is no longer
++  // the one read above, an earlier taker already replaced it: back off.
++  const current = await readClaim(claimPath);
++  if (
++    !current ||
++    current.content !== claim.content ||
++    current.stat.ino !== claim.stat.ino ||
++    current.stat.mtimeMs !== claim.stat.mtimeMs
++  ) {
++    return false;
++  }
++  await write(claimPath, claimOwnerContent(instance), { overwrite: true });
++  return true;
++}
++
++/**
++ * Whether the claim at `claimPath` still names `instance` in this process.
++ * Checked before the claim's event is written, so a writer that was taken over
++ * as abandoned does not write a second event.
++ */
++export async function isClaimHeldBy(
++  claimPath: string,
++  instance: string
++): Promise<boolean> {
++  const claim = await readClaim(claimPath);
++  const owner = claim && parseClaimOwner(claim.content);
++  return owner?.process === identity.process && owner.instance === instance;
++}
+diff --git a/packages/world-local/src/storage/claim-repair.child.mjs b/packages/world-local/src/storage/claim-repair.child.mjs
+new file mode 100644
+index 000000000..6d9113cde
+--- /dev/null
++++ b/packages/world-local/src/storage/claim-repair.child.mjs
+@@ -0,0 +1,63 @@
++// A second OS process for claim-repair.test.ts: it opens its own storage on
++// the parent's data directory, writes the one event the parent sends it, and
++// SIGKILLs itself at the given point of that write, which leaves the step or
++// wait claim without its event. It runs world-local's TypeScript source with
++// Node's type stripping, like in-band-fence.child.mjs.
++//
++// Kill points:
++//   claim:<part>    right after a claim file whose name has <part> is linked
++//   event:<type>    right before the <type> event file is written
++import fs from 'node:fs/promises';
++import { register } from 'node:module';
++import path from 'node:path';
++
++register(
++  `data:text/javascript,${encodeURIComponent(
++    'export async function resolve(s, c, n) { try { return await n(s, c); } catch (e) { if (/^\\.\\.?\\//.test(s) && s.endsWith(".js")) return n(s.slice(0, -3) + ".ts", c); throw e; } }'
++  )}`
++);
++
++// The parent forks this with `serialization: 'advanced'`, so the request's
++// Uint8Array and Date values arrive intact.
++const { dataDir, runId, request, killAt } = await new Promise((resolve) =>
++  process.once('message', resolve)
++);
++const [killKind, killWhat] = killAt.split(':');
++const kill = () => process.kill(process.pid, 'SIGKILL');
++
++const link = fs.link;
++fs.link = async (from, to) => {
++  await link(from, to);
++  const file = String(to);
++  if (
++    killKind === 'claim' &&
++    file.includes(`${path.sep}.locks${path.sep}`) &&
++    file.includes(killWhat)
++  ) {
++    kill();
++  }
++};
++const writeFile = fs.writeFile;
++fs.writeFile = async (file, data, options) => {
++  if (
++    killKind === 'event' &&
++    String(file).includes(`${path.sep}events${path.sep}`) &&
++    typeof data === 'string' &&
++    JSON.parse(data).eventType === killWhat
++  ) {
++    kill();
++  }
++  return writeFile(file, data, options);
++};
++
++const { createStorage } = await import('../storage.ts');
++const storage = createStorage(dataDir);
++try {
++  await storage.events.create(runId, request);
++  process.send({ status: 'written' }, () => process.exit(0));
++} catch (error) {
++  process.send(
++    { status: 'error', message: String(error?.message ?? error) },
++    () => process.exit(0)
++  );
++}
+diff --git a/packages/world-local/src/storage/claim-repair.test.ts b/packages/world-local/src/storage/claim-repair.test.ts
+new file mode 100644
+index 000000000..df44faf27
+--- /dev/null
++++ b/packages/world-local/src/storage/claim-repair.test.ts
+@@ -0,0 +1,494 @@
++/**
++ * A step or wait change takes a claim file, writes its entity, then writes
++ * its event. A process killed between the claim and the event used to leave
++ * the run stuck for good: every later write of that change lost the claim and
++ * was refused, and nothing ever wrote the event.
++ *
++ * Each crash below is a real SIGKILL of a second process at the exact write.
++ * The next write must finish the change, exactly once. A claim whose writer
++ * may still be working must be left alone until it is
++ * CLAIM_ABANDONED_AFTER_MS old.
++ */
++import { fork } from 'node:child_process';
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { EntityConflictError } from '@workflow/errors';
++import { SPEC_VERSION_CURRENT, type Storage } from '@workflow/world';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { createRun, updateRun } from '../test-helpers.js';
++import {
++  CLAIM_ABANDONED_AFTER_MS,
++  claimOwnerContent,
++  isClaimHeldBy,
++  takeOverAbandonedClaim,
++} from './claim-owner.js';
++import { createStorage } from './index.js';
++
++type EventRequest = Parameters<Storage['events']['create']>[1];
++
++// Parks this process's next `.terminal` claim write, so a test can let
++// another process finish the step and die between this write's validation
++// and its claim.
++const gate = vi.hoisted(() => ({
++  armed: false,
++  parked: () => {},
++  release: () => {},
++}));
++
++vi.mock('../fs.js', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('../fs.js')>();
++  return {
++    ...actual,
++    writeExclusive: async (filePath: string, data: string) => {
++      if (gate.armed && filePath.endsWith('.terminal')) {
++        gate.armed = false;
++        await new Promise<void>((resolve) => {
++          gate.release = resolve;
++          gate.parked();
++        });
++      }
++      return actual.writeExclusive(filePath, data);
++    },
++  };
++});
++
++const SPEC = SPEC_VERSION_CURRENT;
++const input = new Uint8Array([1]);
++const requests = {
++  stepCreated: (id: string): EventRequest => ({
++    eventType: 'step_created',
++    specVersion: SPEC,
++    correlationId: id,
++    eventData: { stepName: 'step', input },
++  }),
++  lazyStepStarted: (id: string): EventRequest => ({
++    eventType: 'step_started',
++    specVersion: SPEC,
++    correlationId: id,
++    eventData: { stepName: 'step', input },
++  }),
++  stepStarted: (id: string): EventRequest => ({
++    eventType: 'step_started',
++    specVersion: SPEC,
++    correlationId: id,
++    eventData: { stepName: 'step' },
++  }),
++  // `mark` tells apart the payloads of two writers of the same step.
++  stepCompleted: (id: string, mark = 1): EventRequest => ({
++    eventType: 'step_completed',
++    specVersion: SPEC,
++    correlationId: id,
++    eventData: { stepName: 'step', result: new Uint8Array([mark]) },
++  }),
++  stepFailed: (id: string, mark = 1): EventRequest => ({
++    eventType: 'step_failed',
++    specVersion: SPEC,
++    correlationId: id,
++    eventData: { stepName: 'step', error: new Uint8Array([mark]) },
++  }),
++  waitCreated: (id: string): EventRequest => ({
++    eventType: 'wait_created',
++    specVersion: SPEC,
++    correlationId: id,
++    eventData: { resumeAt: new Date(0) },
++  }),
++  waitCompleted: (id: string): EventRequest => ({
++    eventType: 'wait_completed',
++    specVersion: SPEC,
++    correlationId: id,
++  }),
++};
++
++let testDir: string;
++let storage: Storage;
++let runId: string;
++
++beforeEach(async () => {
++  testDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wl-claim-repair-'));
++  storage = createStorage(testDir);
++  const run = await createRun(storage, {
++    deploymentId: 'dpl_test',
++    workflowName: 'workflow',
++    input,
++  });
++  runId = run.runId;
++  await updateRun(storage, runId, 'run_started');
++});
++
++afterEach(async () => {
++  await fs.rm(testDir, { recursive: true, force: true });
++});
++
++const childScript = fileURLToPath(
++  new URL('./claim-repair.child.mjs', import.meta.url)
++);
++
++/**
++ * Writes `request` from a second process that is SIGKILLed at `killAt` (see
++ * claim-repair.child.mjs), and returns that process's pid, now dead.
++ */
++async function writeAndKill(
++  request: EventRequest,
++  killAt: string
++): Promise<number> {
++  const child = fork(childScript, [], {
++    // Node's own type stripping, nothing inherited from the test runner.
++    execArgv: [],
++    serialization: 'advanced',
++    stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
++  });
++  let answer: unknown;
++  child.on('message', (message) => {
++    answer = message;
++  });
++  const exited = new Promise<NodeJS.Signals | null>((resolve, reject) => {
++    child.once('exit', (_code, signal) => resolve(signal));
++    child.once('error', reject);
++  });
++  child.send({ dataDir: testDir, runId, request, killAt });
++  expect(await exited, `child answered ${JSON.stringify(answer)}`).toBe(
++    'SIGKILL'
++  );
++  return child.pid as number;
++}
++
++async function eventsOf(correlationId: string) {
++  const page = await createStorage(testDir).events.listByCorrelationId({
++    runId,
++    correlationId,
++    resolveData: 'all',
++  });
++  return page.data;
++}
++
++async function eventTypesOf(correlationId: string): Promise<string[]> {
++  return (await eventsOf(correlationId)).map((event) => event.eventType);
++}
++
++function stepClaim(stepId: string, kind: 'created' | 'terminal'): string {
++  return path.join(testDir, '.locks', 'steps', `${runId}-${stepId}.${kind}`);
++}
++
++function waitClaim(waitId: string, kind: 'created' | 'completed'): string {
++  return path.join(testDir, '.locks', 'waits', `${runId}-${waitId}.${kind}`);
++}
++
++async function ageClaim(claimPath: string): Promise<void> {
++  const past = new Date(Date.now() - CLAIM_ABANDONED_AFTER_MS - 1_000);
++  await fs.utimes(claimPath, past, past);
++}
++
++async function startStep(id: string): Promise<void> {
++  await storage.events.create(runId, requests.stepCreated(id));
++  await storage.events.create(runId, requests.stepStarted(id));
++}
++
++describe('a process killed after a claim and before its event', () => {
++  it.each([
++    ['after the claim', 'claim:.created'],
++    ['after the step entity', 'event:step_created'],
++  ])('a lazy step_started is finished by the next one (killed %s)', async (_, killAt) => {
++    await writeAndKill(requests.lazyStepStarted('s'), killAt);
++
++    const result = await storage.events.create(
++      runId,
++      requests.lazyStepStarted('s')
++    );
++
++    expect(result.stepCreated).toBe(true);
++    expect(result.step?.status).toBe('running');
++    expect(await eventTypesOf('s')).toEqual(['step_created', 'step_started']);
++    await expect(
++      storage.events.create(runId, requests.lazyStepStarted('s'))
++    ).rejects.toThrow(EntityConflictError);
++  });
++
++  it.each([
++    ['after the claim', 'claim:.created'],
++    ['after the step entity', 'event:step_created'],
++  ])('a step_created is finished by the next one (killed %s)', async (_, killAt) => {
++    await writeAndKill(requests.stepCreated('s'), killAt);
++
++    const result = await storage.events.create(
++      runId,
++      requests.stepCreated('s')
++    );
++
++    expect(result.step?.status).toBe('pending');
++    expect(await eventTypesOf('s')).toEqual(['step_created']);
++    await expect(
++      storage.events.create(runId, requests.stepCreated('s'))
++    ).rejects.toThrow(EntityConflictError);
++  });
++
++  it('a step_completed killed after the claim is finished by the next one', async () => {
++    await startStep('s');
++    await writeAndKill(requests.stepCompleted('s', 1), 'claim:.terminal');
++
++    const result = await storage.events.create(
++      runId,
++      requests.stepCompleted('s', 2)
++    );
++
++    expect(result.step?.status).toBe('completed');
++    expect(result.step?.output).toEqual(new Uint8Array([2]));
++    expect(await eventTypesOf('s')).toEqual([
++      'step_created',
++      'step_started',
++      'step_completed',
++    ]);
++  });
++
++  it.each([
++    ['step_completed', requests.stepCompleted, 'result'],
++    ['step_failed', requests.stepFailed, 'error'],
++  ] as const)('a %s killed after the step entity is written by the next step_started, from the saved step', async (eventType, terminal, field) => {
++    await startStep('s');
++    await writeAndKill(terminal('s', 1), `event:${eventType}`);
++
++    // The redelivered start is refused, as before: the step is finished.
++    await expect(
++      storage.events.create(runId, requests.stepStarted('s'))
++    ).rejects.toThrow('terminal state');
++
++    const events = await eventsOf('s');
++    expect(events.map((event) => event.eventType)).toEqual([
++      'step_created',
++      'step_started',
++      eventType,
++    ]);
++    const written = events[2] as { eventData?: Record<string, unknown> };
++    expect(written.eventData?.[field]).toEqual(new Uint8Array([1]));
++    // A later terminal write is refused, and adds nothing.
++    await expect(
++      storage.events.create(runId, terminal('s', 2))
++    ).rejects.toThrow(EntityConflictError);
++    expect(await eventTypesOf('s')).toHaveLength(3);
++  });
++
++  it.each([
++    ['after the claim', 'claim:.created'],
++    ['after the wait entity', 'event:wait_created'],
++  ])('a wait_created is finished by the next one (killed %s)', async (_, killAt) => {
++    await writeAndKill(requests.waitCreated('w'), killAt);
++
++    const result = await storage.events.create(
++      runId,
++      requests.waitCreated('w')
++    );
++
++    expect(result.wait?.status).toBe('waiting');
++    expect(await eventTypesOf('w')).toEqual(['wait_created']);
++  });
++
++  it.each([
++    ['after the claim', 'claim:.completed'],
++    ['after the wait entity', 'event:wait_completed'],
++  ])('a wait_completed is finished by the next one (killed %s)', async (_, killAt) => {
++    await storage.events.create(runId, requests.waitCreated('w'));
++    await writeAndKill(requests.waitCompleted('w'), killAt);
++
++    const result = await storage.events.create(
++      runId,
++      requests.waitCompleted('w')
++    );
++
++    expect(result.wait?.status).toBe('completed');
++    expect(await eventTypesOf('w')).toEqual(['wait_created', 'wait_completed']);
++    await expect(
++      storage.events.create(runId, requests.waitCompleted('w'))
++    ).rejects.toThrow('already completed');
++  });
++
++  it('a takeover cut short before it rewrote the claim is taken over in turn', async () => {
++    await startStep('s');
++    await writeAndKill(requests.stepCompleted('s', 1), 'claim:.terminal');
++    // The next writer takes the claim over and dies right after its takeover
++    // marker, before it rewrote the claim.
++    await writeAndKill(requests.stepCompleted('s', 2), 'claim:.takeover.');
++
++    const result = await storage.events.create(
++      runId,
++      requests.stepCompleted('s', 3)
++    );
++
++    expect(result.step?.output).toEqual(new Uint8Array([3]));
++    expect(await eventTypesOf('s')).toEqual([
++      'step_created',
++      'step_started',
++      'step_completed',
++    ]);
++  });
++
++  it('a step finished by a writer that died after this write read it keeps the saved result', async () => {
++    await startStep('s');
++    const parked = new Promise<void>((resolve) => {
++      gate.parked = resolve;
++    });
++    gate.armed = true;
++    // Reads the step as running, then waits at its claim.
++    const late = storage.events.create(runId, requests.stepCompleted('s', 2));
++    await parked;
++    // Meanwhile another process saves the step as completed and dies.
++    await writeAndKill(requests.stepCompleted('s', 1), 'event:step_completed');
++    gate.release();
++
++    await expect(late).rejects.toThrow('terminal state');
++    const events = await eventsOf('s');
++    expect(events.map((event) => event.eventType)).toEqual([
++      'step_created',
++      'step_started',
++      'step_completed',
++    ]);
++    const written = events[2] as { eventData?: { result?: unknown } };
++    expect(written.eventData?.result).toEqual(new Uint8Array([1]));
++    const step = await storage.steps.get(runId, 's', { resolveData: 'all' });
++    expect(step.output).toEqual(new Uint8Array([1]));
++  });
++
++  it('two writers that find the same orphaned claim write one event', async () => {
++    await startStep('s');
++    await writeAndKill(requests.stepCompleted('s', 1), 'claim:.terminal');
++
++    // Two storage instances behave like two processes.
++    const results = await Promise.allSettled([
++      createStorage(testDir).events.create(
++        runId,
++        requests.stepCompleted('s', 2)
++      ),
++      createStorage(testDir).events.create(
++        runId,
++        requests.stepCompleted('s', 3)
++      ),
++    ]);
++
++    const written = results.filter((r) => r.status === 'fulfilled');
++    expect(written).toHaveLength(1);
++    const refused = results.find((r) => r.status === 'rejected');
++    expect(EntityConflictError.is(refused?.reason)).toBe(true);
++    const events = await eventsOf('s');
++    expect(events.filter((e) => e.eventType === 'step_completed')).toHaveLength(
++      1
++    );
++    const winner = (written[0] as PromiseFulfilledResult<{ step?: unknown }>)
++      .value.step as { output: Uint8Array };
++    const step = await storage.steps.get(runId, 's', { resolveData: 'all' });
++    expect(step.output).toEqual(winner.output);
++  });
++});
++
++describe('a claim whose writer may still be working', () => {
++  it.each([
++    [
++      'a live process on this host',
++      () =>
++        JSON.stringify({
++          pid: process.ppid,
++          host: os.hostname(),
++          process: 'another-process',
++          instance: 'another-instance',
++        }),
++    ],
++    [
++      'a process on another host',
++      () =>
++        JSON.stringify({
++          pid: 999_999,
++          host: 'another-host',
++          process: 'another-process',
++          instance: 'another-instance',
++        }),
++    ],
++    ['no one (written by an older version)', () => ''],
++  ])('is left alone until it is old, when it names %s', async (_, owner) => {
++    await startStep('s');
++    await writeAndKill(requests.stepCompleted('s', 1), 'claim:.terminal');
++    const claim = stepClaim('s', 'terminal');
++    await fs.writeFile(claim, owner());
++
++    await expect(
++      storage.events.create(runId, requests.stepCompleted('s', 2))
++    ).rejects.toThrow('terminal state');
++    expect(await eventTypesOf('s')).not.toContain('step_completed');
++
++    await ageClaim(claim);
++    const result = await storage.events.create(
++      runId,
++      requests.stepCompleted('s', 2)
++    );
++    expect(result.step?.status).toBe('completed');
++    expect(await eventTypesOf('s')).toContain('step_completed');
++  });
++
++  it('is left alone when its event is in the log, even if its writer is dead', async () => {
++    await startStep('s');
++    await storage.events.create(runId, requests.stepCompleted('s', 1));
++    const deadPid = await writeAndKill(
++      requests.waitCreated('unrelated'),
++      'claim:.created'
++    );
++    await fs.writeFile(
++      stepClaim('s', 'terminal'),
++      JSON.stringify({
++        pid: deadPid,
++        host: os.hostname(),
++        process: 'dead-process',
++        instance: 'dead-instance',
++      })
++    );
++
++    await expect(
++      storage.events.create(runId, requests.stepCompleted('s', 2))
++    ).rejects.toThrow('terminal state');
++    await expect(
++      storage.events.create(runId, requests.stepStarted('s'))
++    ).rejects.toThrow('terminal state');
++    expect(await eventTypesOf('s')).toEqual([
++      'step_created',
++      'step_started',
++      'step_completed',
++    ]);
++  });
++
++  it('is not taken over from a wait whose writer is alive', async () => {
++    await storage.events.create(runId, requests.waitCreated('w'));
++    await writeAndKill(requests.waitCompleted('w'), 'claim:.completed');
++    await fs.writeFile(
++      waitClaim('w', 'completed'),
++      JSON.stringify({
++        pid: process.ppid,
++        host: os.hostname(),
++        process: 'another-process',
++        instance: 'another-instance',
++      })
++    );
++
++    await expect(
++      storage.events.create(runId, requests.waitCompleted('w'))
++    ).rejects.toThrow('already completed');
++    expect(await eventTypesOf('w')).toEqual(['wait_created']);
++  });
++});
++
++describe('takeOverAbandonedClaim', () => {
++  const orphaned = async () => true;
++
++  it('moves an old claim to its taker, so the writer it replaced stops', async () => {
++    const claim = path.join(testDir, 'claim');
++    await fs.writeFile(claim, claimOwnerContent('first'));
++    expect(await takeOverAbandonedClaim(claim, 'second', orphaned)).toBe(false);
++
++    await ageClaim(claim);
++    expect(await takeOverAbandonedClaim(claim, 'second', orphaned)).toBe(true);
++    expect(await isClaimHeldBy(claim, 'first')).toBe(false);
++    expect(await isClaimHeldBy(claim, 'second')).toBe(true);
++  });
++
++  it('takes over a claim of the same instance at once: its call has ended', async () => {
++    const claim = path.join(testDir, 'claim');
++    await fs.writeFile(claim, claimOwnerContent('same'));
++    expect(await takeOverAbandonedClaim(claim, 'same', orphaned)).toBe(true);
++  });
++});
+diff --git a/packages/world-local/src/storage/events-storage.ts b/packages/world-local/src/storage/events-storage.ts
+index d9bcce4fd..f875e9899 100644
+--- a/packages/world-local/src/storage/events-storage.ts
++++ b/packages/world-local/src/storage/events-storage.ts
+@@ -85,6 +85,13 @@ import {
+   writeJSON,
+ } from '../fs.js';
+ import { withInProcessLock } from '../util.js';
++import {
++  CLAIM_ABANDONED_AFTER_MS,
++  claimOwnerContent,
++  isClaimHeldBy,
++  newClaimInstanceId,
++  takeOverAbandonedClaim,
++} from './claim-owner.js';
+ import { stripEventDataRefs } from './filters.js';
+ import {
+   getObjectCreatedAt,
+@@ -998,8 +1005,190 @@ export function createEventsStorage(
+   // (runId, correlationId) so the "claim token, then write hook
+   // entity + event" sequence runs to completion before another
+   // in-process invocation enters the dedup branch.
++  //
++  // `waitLocks` does the same for `wait_created` / `wait_completed`, so a
++  // claim this instance wrote always belongs to a call that has ended by the
++  // time another call of this instance reads it (see `claim-owner.ts`).
+   const stepLocks = new Map<string, Promise<unknown>>();
++  const waitLocks = new Map<string, Promise<unknown>>();
+   const hookLocks = new Map<string, Promise<unknown>>();
++  // Names this instance in the step and wait claim files it writes.
++  const claimInstance = newClaimInstanceId();
++
++  /**
++   * Whether the run's log has an event for `correlationId`, of one of
++   * `eventTypes` when given.
++   */
++  async function hasCorrelatedEvent(
++    runId: string,
++    correlationId: string,
++    eventTypes?: readonly string[]
++  ): Promise<boolean> {
++    const result = await paginatedFileSystemQuery({
++      directory: path.join(basedir, runEntityDir('events', runId)),
++      schema: ReadEventSchema,
++      cachedItems: eventCache,
++      filePrefix: `${runId}-`,
++      filter: (event) =>
++        event.correlationId === correlationId &&
++        (!eventTypes || eventTypes.includes(event.eventType)),
++      limit: 1,
++      getCreatedAt: getObjectCreatedAt('evnt'),
++      getId: (event) => event.eventId,
++    });
++    return result.data.length > 0;
++  }
++
++  /**
++   * Called by a write that lost the step or wait claim at `claimPath`. A
++   * process that died after taking the claim and before writing its event
++   * leaves the claim with no event, and every later write would lose the claim
++   * and refuse, so the run could never advance. When the claim's event is not
++   * in the log and its writer is gone, this takes the claim over and returns
++   * true: the caller then finishes the change itself. Otherwise the caller
++   * refuses, as before.
++   *
++   * `eventTypes` are the events the claim stands for. Omitted for a creation
++   * claim, which any event of the step or wait proves was written.
++   */
++  async function adoptOrphanedClaim(
++    claimPath: string,
++    runId: string,
++    correlationId: string,
++    eventTypes?: readonly string[]
++  ): Promise<boolean> {
++    return takeOverAbandonedClaim(
++      claimPath,
++      claimInstance,
++      async () => !(await hasCorrelatedEvent(runId, correlationId, eventTypes))
++    );
++  }
++
++  /**
++   * Takes the claim on a step's `step_completed` / `step_failed`, so only one
++   * terminal write lands, or throws the refusal. A claim whose terminal write a
++   * crash cut short is taken over (see `adoptOrphanedClaim`).
++   */
++  async function claimStepTerminal(
++    runId: string,
++    stepId: string
++  ): Promise<string> {
++    const claimPath = stepClaimPath(runId, stepId, 'terminal');
++    if (await writeExclusive(claimPath, claimOwnerContent(claimInstance))) {
++      return claimPath;
++    }
++    if (
++      !(await adoptOrphanedClaim(claimPath, runId, stepId, [
++        'step_completed',
++        'step_failed',
++      ]))
++    ) {
++      throw new EntityConflictError('Cannot modify step in terminal state');
++    }
++    // The dead writer may have saved the step as finished after this call
++    // read it. Its saved result wins over this write's, as at validation.
++    const saved = await readJSONWithFallback(
++      basedir,
++      runEntityDir('steps', runId),
++      `${runId}-${stepId}`,
++      StepSchema,
++      tag
++    );
++    if (saved && isTerminalStepStatus(saved.status)) {
++      await storeSavedTerminalStepEvent(runId, saved);
++      throw new EntityConflictError(
++        `Cannot modify step in terminal state "${saved.status}"`
++      );
++    }
++    return claimPath;
++  }
++
++  function stepClaimPath(
++    runId: string,
++    stepId: string,
++    kind: 'created' | 'terminal'
++  ): string {
++    const name = `${runId}-${stepId}.${kind}`;
++    return resolveWithinBase(
++      basedir,
++      '.locks',
++      'steps',
++      tag ? `${name}.${tag}` : name
++    );
++  }
++
++  function waitClaimPath(
++    waitCompositeKey: string,
++    kind: 'created' | 'completed'
++  ): string {
++    const name = `${waitCompositeKey}.${kind}`;
++    return resolveWithinBase(
++      basedir,
++      '.locks',
++      'waits',
++      tag ? `${name}.${tag}` : name
++    );
++  }
++
++  /**
++   * Writes the missing terminal event of a step that is `completed` or
++   * `failed` with no `step_completed` / `step_failed` in the log: a crash
++   * after the step entity's terminal write and before its event. The event is
++   * built from the step entity, never from the write that found it, which is
++   * still refused. The runtime maps that refusal to `skipped` and reloads the
++   * log, where it now finds the step finished.
++   */
++  async function repairTerminalStepEvent(
++    runId: string,
++    step: Step
++  ): Promise<void> {
++    if (step.status !== 'completed' && step.status !== 'failed') return;
++    if (
++      !(await adoptOrphanedClaim(
++        stepClaimPath(runId, step.stepId, 'terminal'),
++        runId,
++        step.stepId,
++        ['step_completed', 'step_failed']
++      ))
++    ) {
++      return;
++    }
++    await storeSavedTerminalStepEvent(runId, step);
++  }
++
++  /**
++   * Writes a finished step's terminal event from the saved step entity. The
++   * caller holds the step's `.terminal` claim, so no other write adds one.
++   */
++  async function storeSavedTerminalStepEvent(
++    runId: string,
++    step: Step
++  ): Promise<void> {
++    if (step.status !== 'completed' && step.status !== 'failed') return;
++    const base = {
++      runId,
++      eventId: await mintEventId(runId),
++      createdAt: new Date(),
++      specVersion: step.specVersion ?? SPEC_VERSION_CURRENT,
++      correlationId: step.stepId,
++    };
++    await storeEvent(
++      step.status === 'completed'
++        ? {
++            ...base,
++            eventType: 'step_completed',
++            eventData: { stepName: step.stepName, result: step.output },
++          }
++        : {
++            ...base,
++            eventType: 'step_failed',
++            eventData: {
++              stepName: step.stepName,
++              error: step.error as Uint8Array,
++            },
++          }
++    );
++  }
+   const hookLockKey = (runId: string, hookId: string) =>
+     tag ? `${runId}-${hookId}.hook.${tag}` : `${runId}-${hookId}.hook`;
+ 
+@@ -1051,6 +1240,17 @@ export function createEventsStorage(
+           : `${runId}-${data.correlationId}`;
+         return withInProcessLock(stepLocks, lockKey, createImpl);
+       }
++      if (
++        (data.eventType === 'wait_created' ||
++          data.eventType === 'wait_completed') &&
++        runId &&
++        data.correlationId
++      ) {
++        const lockKey = tag
++          ? `${runId}-${data.correlationId}.${tag}`
++          : `${runId}-${data.correlationId}`;
++        return withInProcessLock(waitLocks, lockKey, createImpl);
++      }
+       // `hook_created` is serialized per-(runId, hookId) so the
+       // "claim token, write hook entity, write event" sequence runs to
+       // completion before another in-process invocation enters the
+@@ -1097,6 +1297,25 @@ export function createEventsStorage(
+         // drawn at function entry would sort after it.
+         let eventId = '';
+         let eventIdPinned = false;
++        // The step or wait claim this call wrote or took over, and when. A
++        // claim older than CLAIM_ABANDONED_AFTER_MS can be taken over by
++        // another writer, so past half that age the event is written only if
++        // the claim still names this instance.
++        let heldClaim: { path: string; at: number } | undefined;
++        const assertClaimStillHeld = async (): Promise<void> => {
++          if (
++            heldClaim &&
++            Date.now() - heldClaim.at >= CLAIM_ABANDONED_AFTER_MS / 2 &&
++            !(await isClaimHeldBy(heldClaim.path, claimInstance))
++          ) {
++            throw new EntityConflictError(
++              `Claim "${path.basename(heldClaim.path)}" was taken over by another writer`
++            );
++          }
++        };
++        // Set when a lazy step_started took over the create-claim of a
++        // creation that a crash cut short.
++        let lazyCreateAdopted = false;
+         // The eventId currently recorded in this resume's `(runId, resumeId)`
+         // claim, when one was written or read below. An unpinned publish is
+         // free to land somewhere else, and the claim is the fast path other
+@@ -1402,10 +1621,25 @@ export function createEventsStorage(
+           // transition below permits re-starting a non-terminal step (retries
+           // rely on that), so without this gate a loser would re-start a
+           // running step and run the body a second time.
++          //
++          // A step left `pending` with no step_created in the log is a
++          // creation cut short after its claim and entity, not a winner's:
++          // this call takes over the claim and finishes the creation.
+           if (lazyStepStart && validatedStep) {
+-            throw new EntityConflictError(
+-              `Step "${data.correlationId}" already created`
+-            );
++            if (
++              validatedStep.status !== 'pending' ||
++              !(await adoptOrphanedClaim(
++                stepClaimPath(effectiveRunId, data.correlationId, 'created'),
++                effectiveRunId,
++                data.correlationId
++              ))
++            ) {
++              throw new EntityConflictError(
++                `Step "${data.correlationId}" already created`
++              );
++            }
++            lazyCreateAdopted = true;
++            validatedStep = null;
+           }
+ 
+           // Step terminal state validation. validatedStep can be null only on
+@@ -1413,6 +1647,7 @@ export function createEventsStorage(
+           // guard against in that case, so these checks are skipped.
+           if (validatedStep) {
+             if (isTerminalStepStatus(validatedStep.status)) {
++              await repairTerminalStepEvent(effectiveRunId, validatedStep);
+               throw new EntityConflictError(
+                 `Cannot modify step in terminal state "${validatedStep.status}"`
+               );
+@@ -2096,25 +2331,30 @@ export function createEventsStorage(
+           // cross-process races (two pnpm workers, redelivered queue messages,
+           // etc.). The loser throws EntityConflictError so the runtime's
+           // existing catch path can swallow it and avoid double-queuing the
+-          // step.
+-          const stepCreatedLockName = tag
+-            ? `${effectiveRunId}-${data.correlationId}.created.${tag}`
+-            : `${effectiveRunId}-${data.correlationId}.created`;
+-          const stepCreatedLockPath = resolveWithinBase(
+-            basedir,
+-            '.locks',
+-            'steps',
+-            stepCreatedLockName
++          // step. A claim whose creation a crash cut short is taken over
++          // instead (see `adoptOrphanedClaim`).
++          const stepCreatedLockPath = stepClaimPath(
++            effectiveRunId,
++            data.correlationId,
++            'created'
+           );
+           const stepCreatedClaimed = await writeExclusive(
+             stepCreatedLockPath,
+-            ''
++            claimOwnerContent(claimInstance)
+           );
+-          if (!stepCreatedClaimed) {
++          const stepCreatedAdopted =
++            !stepCreatedClaimed &&
++            (await adoptOrphanedClaim(
++              stepCreatedLockPath,
++              effectiveRunId,
++              data.correlationId
++            ));
++          if (!stepCreatedClaimed && !stepCreatedAdopted) {
+             throw new EntityConflictError(
+               `Step "${data.correlationId}" already created`
+             );
+           }
++          heldClaim = { path: stepCreatedLockPath, at: Date.now() };
+           const stepData = data.eventData as {
+             stepName: string;
+             input: any;
+@@ -2143,7 +2383,9 @@ export function createEventsStorage(
+               stepCompositeKey,
+               tag
+             ),
+-            step
++            step,
++            // A creation cut short may have left the entity behind.
++            { overwrite: stepCreatedAdopted }
+           );
+         } else if (data.eventType === 'step_started') {
+           // step_started: Increments attempt, sets status to 'running'
+@@ -2158,20 +2400,29 @@ export function createEventsStorage(
+           // consumer marks hasCreatedEvent only when it observes that event).
+           if (!validatedStep && lazyStepStart) {
+             const lazyData = data.eventData;
+-            const stepCreatedLockName = tag
+-              ? `${effectiveRunId}-${data.correlationId}.created.${tag}`
+-              : `${effectiveRunId}-${data.correlationId}.created`;
+-            const stepCreatedLockPath = resolveWithinBase(
+-              basedir,
+-              '.locks',
+-              'steps',
+-              stepCreatedLockName
+-            );
+-            const stepCreatedClaimed = await writeExclusive(
+-              stepCreatedLockPath,
+-              ''
++            const stepCreatedLockPath = stepClaimPath(
++              effectiveRunId,
++              data.correlationId,
++              'created'
+             );
++            // Taken over at validation when the entity was left behind.
++            let stepCreateAdopted = lazyCreateAdopted;
++            const stepCreatedClaimed =
++              stepCreateAdopted ||
++              (await writeExclusive(
++                stepCreatedLockPath,
++                claimOwnerContent(claimInstance)
++              ));
+             if (!stepCreatedClaimed) {
++              // A crash after the claim and before the entity leaves only the
++              // claim: take it over and create the step.
++              stepCreateAdopted = await adoptOrphanedClaim(
++                stepCreatedLockPath,
++                effectiveRunId,
++                data.correlationId
++              );
++            }
++            if (!stepCreatedClaimed && !stepCreateAdopted) {
+               // A concurrent handler already claimed the create for this
+               // step. The atomic claim is the exactly-once ownership gate:
+               // only the winner runs the step body inline. Throw
+@@ -2183,6 +2434,7 @@ export function createEventsStorage(
+                 `Step "${data.correlationId}" already created`
+               );
+             } else {
++              heldClaim = { path: stepCreatedLockPath, at: Date.now() };
+               const createdStep: Step = {
+                 runId: effectiveRunId,
+                 stepId: data.correlationId,
+@@ -2205,7 +2457,8 @@ export function createEventsStorage(
+                   `${effectiveRunId}-${data.correlationId}`,
+                   tag
+                 ),
+-                createdStep
++                createdStep,
++                { overwrite: stepCreateAdopted }
+               );
+               // Write the synthetic step_created event so replay observes it
+               // (the client step consumer sets hasCreatedEvent only on a
+@@ -2232,6 +2485,7 @@ export function createEventsStorage(
+                   input: lazyData.input,
+                 },
+               };
++              await assertClaimStillHeld();
+               await storeEvent(stepCreatedEvent);
+               validatedStep = createdStep;
+               stepCreatedLazily = true;
+@@ -2302,21 +2556,10 @@ export function createEventsStorage(
+           const completedData = data.eventData as { result: any };
+           if (validatedStep) {
+             const stepCompositeKey = `${effectiveRunId}-${data.correlationId}`;
+-            const lockName = tag
+-              ? `${stepCompositeKey}.terminal.${tag}`
+-              : `${stepCompositeKey}.terminal`;
+-            const terminalLockPath = resolveWithinBase(
+-              basedir,
+-              '.locks',
+-              'steps',
+-              lockName
+-            );
+-            const claimed = await writeExclusive(terminalLockPath, '');
+-            if (!claimed) {
+-              throw new EntityConflictError(
+-                'Cannot modify step in terminal state'
+-              );
+-            }
++            heldClaim = {
++              path: await claimStepTerminal(effectiveRunId, data.correlationId),
++              at: Date.now(),
++            };
+             step = {
+               ...validatedStep,
+               status: 'completed',
+@@ -2344,21 +2587,10 @@ export function createEventsStorage(
+           };
+           if (validatedStep) {
+             const stepCompositeKey = `${effectiveRunId}-${data.correlationId}`;
+-            const lockName = tag
+-              ? `${stepCompositeKey}.terminal.${tag}`
+-              : `${stepCompositeKey}.terminal`;
+-            const terminalLockPath = resolveWithinBase(
+-              basedir,
+-              '.locks',
+-              'steps',
+-              lockName
+-            );
+-            const claimed = await writeExclusive(terminalLockPath, '');
+-            if (!claimed) {
+-              throw new EntityConflictError(
+-                'Cannot modify step in terminal state'
+-              );
+-            }
++            heldClaim = {
++              path: await claimStepTerminal(effectiveRunId, data.correlationId),
++              at: Date.now(),
++            };
+             // The error field is SerializedData (Uint8Array) produced by
+             // dehydrateStepError. We store it verbatim. Consumers hydrate it
+             // via hydrateStepError to reconstruct the original thrown value.
+@@ -2991,26 +3223,31 @@ export function createEventsStorage(
+           // Atomic claim on a per-(runId, correlationId) constraint file
+           // ensures duplicate wait_created from concurrent invocations
+           // surfaces as EntityConflictError (replaces a prior TOCTOU
+-          // read-then-check that could let both writers through).
++          // read-then-check that could let both writers through). A claim
++          // whose creation a crash cut short is taken over instead (see
++          // `adoptOrphanedClaim`).
+           const waitCompositeKey = `${effectiveRunId}-${data.correlationId}`;
+-          const waitCreatedLockName = tag
+-            ? `${waitCompositeKey}.created.${tag}`
+-            : `${waitCompositeKey}.created`;
+-          const waitCreatedLockPath = resolveWithinBase(
+-            basedir,
+-            '.locks',
+-            'waits',
+-            waitCreatedLockName
++          const waitCreatedLockPath = waitClaimPath(
++            waitCompositeKey,
++            'created'
+           );
+           const waitCreatedClaimed = await writeExclusive(
+             waitCreatedLockPath,
+-            ''
++            claimOwnerContent(claimInstance)
+           );
+-          if (!waitCreatedClaimed) {
++          const waitCreatedAdopted =
++            !waitCreatedClaimed &&
++            (await adoptOrphanedClaim(
++              waitCreatedLockPath,
++              effectiveRunId,
++              data.correlationId
++            ));
++          if (!waitCreatedClaimed && !waitCreatedAdopted) {
+             throw new EntityConflictError(
+               `Wait "${data.correlationId}" already exists`
+             );
+           }
++          heldClaim = { path: waitCreatedLockPath, at: Date.now() };
+           const waitData = data.eventData as {
+             resumeAt?: Date;
+           };
+@@ -3026,28 +3263,35 @@ export function createEventsStorage(
+           };
+           await writeJSON(
+             taggedPath(basedir, 'waits', waitCompositeKey, tag),
+-            wait
++            wait,
++            // A creation cut short may have left the entity behind.
++            { overwrite: waitCreatedAdopted }
+           );
+         } else if (data.eventType === 'wait_completed') {
+           // wait_completed: Transitions wait to 'completed', rejects duplicates.
+           // Uses writeExclusive on a lock file to atomically prevent concurrent
+-          // invocations from both completing the same wait (TOCTOU race).
++          // invocations from both completing the same wait (TOCTOU race). A
++          // claim whose completion a crash cut short is taken over instead
++          // (see `adoptOrphanedClaim`).
+           const waitCompositeKey = `${effectiveRunId}-${data.correlationId}`;
+-          const waitLockName = tag
+-            ? `${waitCompositeKey}.completed.${tag}`
+-            : `${waitCompositeKey}.completed`;
+-          const lockPath = resolveWithinBase(
+-            basedir,
+-            '.locks',
+-            'waits',
+-            waitLockName
+-          );
+-          const claimed = await writeExclusive(lockPath, '');
++          const lockPath = waitClaimPath(waitCompositeKey, 'completed');
++          const claimed =
++            (await writeExclusive(
++              lockPath,
++              claimOwnerContent(claimInstance)
++            )) ||
++            (await adoptOrphanedClaim(
++              lockPath,
++              effectiveRunId,
++              data.correlationId,
++              ['wait_completed']
++            ));
+           if (!claimed) {
+             throw new EntityConflictError(
+               `Wait "${data.correlationId}" already completed`
+             );
+           }
++          heldClaim = { path: lockPath, at: Date.now() };
+           const existingWait = await readJSONWithFallback(
+             basedir,
+             'waits',
+@@ -3237,6 +3481,9 @@ export function createEventsStorage(
+           serializedEvent = JSON.stringify(event, jsonReplacer, 2);
+           eventPublished = true;
+         }
++        if (!eventPublished) {
++          await assertClaimStillHeld();
++        }
+         for (let attempt = 0; !eventPublished; attempt++) {
+           if (data.eventType === 'hook_received') {
+             // Step 1: fast path. The marker is the authoritative durable

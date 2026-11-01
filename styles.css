@@ -54,6 +54,9 @@ code, .mono { font-family: var(--f-mono); font-size: 0.86em; }
 .prose strong { color: var(--ink); font-weight: 500; }
 .stack { display: grid; gap: 16px; }
 .eyebrow { font-size: 14px; color: var(--ink-3); }
+a.eyebrow { justify-self: start; text-decoration: none; }
+a.eyebrow:hover { color: var(--ink); }
+.foot { font-size: 14px; line-height: 1.55; color: var(--ink-3); max-width: 760px; }
 .today { color: var(--red); }
 .pr { color: var(--blue); }
 
@@ -67,8 +70,8 @@ code, .mono { font-family: var(--f-mono); font-size: 0.86em; }
 .nav nav { display: flex; gap: 18px; font-size: 14.5px; }
 .nav nav a { color: var(--ink-2); text-decoration: none; }
 .nav nav a:hover { color: var(--ink); }
-@media (max-width: 560px) { .nav nav a.wide { display: none; } .nav .end { gap: 12px; } .nav nav { gap: 12px; } }
-@media (max-width: 400px) { .nav nav { display: none; } }
+@media (max-width: 760px) { .nav nav a.wide { display: none; } .nav .end { gap: 12px; } .nav nav { gap: 12px; } }
+@media (max-width: 640px) { .nav nav { display: none; } }
 
 /* Theme toggle: system, light, dark */
 .themes { display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px; background: var(--panel-2); }
@@ -230,10 +233,11 @@ pre.code .rem { color: var(--ink-3); text-decoration: line-through; }
 .switch button { font: 14.5px/1 var(--f-body); color: var(--ink-2); background: transparent; border: 0; border-radius: 999px; padding: 9px 16px; cursor: pointer; }
 .switch button:hover { color: var(--ink); }
 .switch button[aria-selected="true"] { color: var(--ink); background: var(--panel); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
-.deck { position: relative; margin-block: 72px 96px; }
+.deck { position: relative; margin-block: 112px 96px; }
 .deck-card { background: var(--panel); border: 1px solid var(--line); border-radius: 22px; overflow: hidden; transform-origin: 50% 0; transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.5s; }
 .deck-card.front { position: relative; z-index: 2; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03), 0 12px 32px -16px rgba(0, 0, 0, 0.12); }
 .deck-card.back { position: absolute; inset: 0; z-index: 1; transform: translateY(-46px) scale(0.95); opacity: 0.7; background: var(--well); }
+.deck-card.back[data-depth="2"] { z-index: 0; transform: translateY(-88px) scale(0.9); opacity: 0.5; }
 .deck-card.back:hover { opacity: 0.9; }
 .card-strip { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 26px; color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--line); font: 500 15px/1.2 var(--f-body); text-align: left; cursor: pointer; }
 .card-strip em { margin-left: 10px; font: 400 14px var(--f-body); font-style: normal; color: var(--ink-3); }
@@ -243,3 +247,25 @@ pre.code .rem { color: var(--ink-3); text-decoration: line-through; }
 .card-body { display: grid; gap: 28px; padding: 40px 32px 48px; }
 @media (max-width: 640px) { .card-body { padding: 28px 16px 32px; } .card-strip { padding: 14px 16px; } }
 @media (prefers-reduced-motion: reduce) { .deck-card { transition: none; } }
+
+/* Crash demo: the files on disk and what each write did */
+.crash-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pill { font: 500 13px/1 var(--f-body); padding: 6px 10px; border-radius: 999px; background: var(--panel-2); color: var(--ink-2); }
+.pill.bad { background: var(--red-soft); color: var(--red); }
+.pill.ok { background: var(--blue-soft); color: var(--blue); }
+.proc { display: flex; align-items: center; gap: 8px; font: 12.5px/1.6 var(--f-mono); color: var(--ink-2); }
+.proc i { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+.proc i.dead { background: var(--red); }
+.blk.file { grid-template-columns: 3.6em minmax(0, 1fr) auto; }
+.blk.file .txt { color: var(--ink-2); }
+.blk.file .n { color: var(--ink); }
+.blk.hot { border-color: var(--ink-3); }
+.blk.add .n, .blk.add .txt { color: var(--red); }
+.log { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; align-content: start; min-height: calc(7 * 1.6em + 12px); font: 12.5px/1.6 var(--f-mono); color: var(--ink-3); }
+.log li { padding-left: 1.2em; text-indent: -1.2em; }
+.log li::before { content: "› "; }
+.log li.bad { color: color-mix(in srgb, var(--red) 70%, var(--ink-3)); }
+.log li.good { color: color-mix(in srgb, var(--blue) 70%, var(--ink-3)); }
+.log li.now { color: var(--ink); }
+.log li.now.bad { color: var(--red); }
+.log li.now.good { color: var(--blue); }
